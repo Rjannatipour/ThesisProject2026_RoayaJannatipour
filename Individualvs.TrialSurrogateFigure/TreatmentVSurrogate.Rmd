@@ -1,0 +1,117 @@
+```{r}
+library(ggplot2)
+```
+
+
+
+```{r}
+# Individual Surrogate Figure - Example Data
+
+indivsurrogate <- data.frame(
+  Participant = c('alpha', 'alpha','beta', 'beta','gamma', 'gamma', 'delta', 'delta'),
+  Surrogate = c(1, 1.5,1, 1.5,2, 2.5, 1.75, 2.25),
+  Endpoint = c(1, 1.5, 2, 2.5, 1.25, 1.75, 2, 2.5),
+  Treatment = c('Unvaccinated', 'Vaccinated','Unvaccinated', 'Vaccinated', 'Unvaccinated', 'Vaccinated', 'Unvaccinated', 'Vaccinated')
+)
+
+  
+```
+
+
+
+```{r}
+# Plotting Individual-Level Surrogate Figure
+
+ggplot(
+  data = indivsurrogate,
+  aes(
+    x = Surrogate,
+    y = Endpoint,
+    shape = Treatment,
+    color = Participant
+  )
+) +
+  geom_point(size = 6) +
+  geom_line(aes(group = Participant), linetype = "dashed") +
+
+  # Colorblind-friendly colors
+  scale_color_manual(values = c(
+    alpha = "#0072B2",  # blue
+    beta  = "#D55E00",  # vermillion
+    gamma = "#009E73",  # green
+    delta = "#CC79A7"   # purple
+  )) +
+
+  # Larger fonts
+  theme_minimal(base_size = 16) +
+  theme(
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 14),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 14),
+    plot.title = element_text(size = 20, face = "bold")
+  ) +
+
+  labs(
+    x = "Surrogate Marker",
+    y = "Clinical Endpoint",
+    color = "Participant",
+    shape = "Treatment"
+  )
+```
+
+
+
+
+```{r}
+# Trial Surrogate Figure - Example Data
+
+trialsurrogate <- data.frame(
+  Participant = c('alpha', 'beta','gamma', 'delta','beta', 'gamma', 'alpha', 'delta'),
+  Surrogate = c(1, 1 ,1.5, 1.5,2, 2, 2.5, 2.5),
+  Endpoint = c(1, 1.5, 1, 1.5, 2, 2.5, 2, 2.5),
+  Treatment = c('Unvaccinated', 'Unvaccinated','Unvaccinated', 'Unvaccinated', 'Vaccinated', 'Vaccinated', 'Vaccinated', 'Vaccinated')
+)
+
+```
+
+
+```{r}
+
+ggplot(
+  data = trialsurrogate,
+  aes(
+    x = Surrogate,
+    y = Endpoint,
+    shape = Treatment,
+    color = Participant
+  )
+) +
+  geom_point(size = 6) +
+
+  # Colorblind-friendly colors
+  scale_color_manual(values = c(
+    alpha = "#0072B2",  # blue
+    beta  = "#D55E00",  # vermillion
+    gamma = "#009E73",  # green
+    delta = "#CC79A7"   # purple
+  )) +
+
+  # Larger fonts
+  theme_minimal(base_size = 16) +
+  theme(
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 14),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 14),
+    plot.title = element_text(size = 20, face = "bold")
+  ) +
+
+  labs(
+    x = "Surrogate Marker",
+    y = "Clinical Endpoint",
+    color = "Participant",
+    shape = "Treatment"
+  )
+```
+

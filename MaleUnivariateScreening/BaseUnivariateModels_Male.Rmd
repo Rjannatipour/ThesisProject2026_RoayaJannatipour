@@ -1,0 +1,433 @@
+---
+title: "BaseUnivariateModels_Male"
+output: html_document
+date: "2026-04-07"
+---
+
+
+```{r}
+library(dplyr)
+library(gtsummary)
+library(purrr)
+library(janitor)
+library(tidyr)
+library(boot)
+library(matrixStats)
+library(caret)
+library(readr)
+library(glue)
+library(ggplot2)
+library(caret)
+library(glmnet)
+library(randomForest)
+
+
+```
+
+```{r}
+#Load in objects from StagePreProcessing
+BaseModel <- readRDS(here::here("MalePreProcessing","BaseModel.rds"))
+is2norm01 <- readRDS(here::here("rawdata","is2norm01.rds"))
+merge <- readRDS(here::here("rawdata","mergemale.rds"))
+```
+
+```{r}
+#Corrected K fold Validation - Base Model
+
+set.seed(123)
+
+k <- 10
+n <- nrow(BaseModel)
+
+# Create fold assignments
+folds <- sample(rep(1:k, length.out = n))
+
+# Storage
+predictions <- vector("numeric", n)
+
+for (i in 1:k) {
+  train_idx <- which(folds != i)
+  test_idx  <- which(folds == i)
+  
+  train_data <- BaseModel[train_idx, ]
+  test_data  <- BaseModel[test_idx, ]
+  
+  # Fit model (example: linear regression)
+  
+BaseModelReg <- lm(maxFC ~ age_imputed, data = train_data) 
+
+  # Predict on held-out fold
+  predictions[test_idx] <- predict(BaseModelReg, newdata = test_data)
+}
+
+# Final dataframe of observed vs predicted
+cv_results <- data.frame(
+  observed  = BaseModel$maxFC,
+  predicted = predictions
+)
+
+cv_results
+
+#RMSE and R Squared Values
+#RMSE: Measures how far your predictions are from the true values, on average
+#Standardized RMSE: RMSE of your predictions compared to the true values, divided by standard dev of true values. The lower this value the better i.e if sRMSE is 1, your predictions are as good, on average, as model which predicts response with no predictor information
+
+# Compute evaluation metrics
+## RMSE
+rmse_val <- caret::RMSE(cv_results$observed, cv_results$predicted)
+
+## Standardised RMSE (RMSE divided by standard deviation of response)
+sd_y <- sd(cv_results$observed)
+std_rmse <- rmse_val / sd_y
+
+# R2 - squared pearson correlation between response and predictions
+baser2 <-
+  cor(cv_results$observed, cv_results$predicted, method = "pearson") ^ {
+    2}
+
+print(paste0("Standardised RMSE: ", round(std_rmse, 3)))
+print(paste0("R2 statistic: ", round(baser2, 3)))
+
+```
+
+```{r}
+#Observed vs. Predicted - Base Model
+cv_results = cv_results %>% mutate(Gender = "Male")
+
+
+basemodelmaleplot <- ggplot(cv_results, aes(y = predicted, x = observed, colour = Gender)) +
+  geom_point() +
+  
+  scale_colour_manual(
+    values = c("Male" = "blue"),
+    name = "Gender"
+  ) +
+  
+  xlim(-1, 12) +
+  ylim(-1, 12) +
+  
+  annotate(
+    "text",
+    x = 2, y = 10,
+    label = paste0(
+      "R² = ", round(baser2, 3),
+      "\nsRMSE = ", round(std_rmse, 3)
+    )
+  ) +
+  
+  geom_abline(intercept = 0, slope = 1) +
+  
+  labs(
+    x = "Log Observed maxFC",
+    y = "Log Predicted maxFC",
+    title = "Observed vs. Predicted maxFC: Base Model"
+  ) +
+  
+  coord_fixed()
+
+ggsave(
+  here("figurespng", "basemodelmaleplot.png"),
+  basemodelmaleplot,
+  width = 5,
+  height = 4,
+  dpi = 500
+)
+
+saveRDS(
+  basemodelmaleplot,
+  here("figuresrds", "basemodelmaleplot.rds")
+)
+```
+
+
+
+```{r}
+# Univariate Gene Model
+## Switching inner and outer loops
+#Conceptual: Outer loop is CV folds and inner fold is genes. For each fold, we hold out part of data, fit many different gene models on the same training set, and predict all genes on same test set.
+
+#Outer Loop
+
+r <- ncol(is2norm01) 
+n_genes <- r-1
+n2 <- nrow(merge)
+
+
+predgenematrix <- matrix(
+  NA,
+  nrow =n2,
+  ncol= n_genes,
+  dimnames = list(
+    merge$participant_id,
+    colnames(is2norm01)[2:r]
+  ))
+
+set.seed(123)
+k <- 10
+n <- nrow(BaseModel)
+folds <- sample(rep(1:k, length.out = n))  
+models <- vector("list", r - 1)
+
+
+for (fold in 1:k) {
+  
+  train_idx <- which(folds != fold)
+  test_idx  <- which(folds == fold)
+  
+
+  train_data <- merge[train_idx, ]
+  test_data  <- merge[test_idx, ]
+  
+for (i in 1:(r - 1)) {
+  
+  gene_name <- colnames(is2norm01)[i + 1]
+  
+  formula_i <- as.formula(
+    paste("maxFC ~ age_imputed +", gene_name)
+  )
+  
+  models[[i]] <- lm(formula_i, data = train_data)
+  
+}
+  IntModels <- sapply(models, predict, newdata = test_data) #Uses all trained models from the inner loop to predict on the test set
+ predgenematrix[test_idx,]<- IntModels #Stores all gene predictions for that fold, must happen after all models are trained and after predictions are generated
+ 
+cat("Fold", fold, "finished\n")
+
+}
+
+predgenematrix
+```
+
+```{r}
+#Calculating average RMSE across folds
+predgenematrix <- as.data.frame(predgenematrix)
+predgenematrix$participant_id <- rownames(predgenematrix)
+predgenematrix <- BaseModel %>% select(participant_id, maxFC) %>% right_join(predgenematrix, by = "participant_id") %>% relocate(maxFC, .before = a1cf)
+
+
+ gene_matrix <- as.matrix(predgenematrix[, 3:ncol(predgenematrix)])
+
+y <- predgenematrix$maxFC   # your observed/measured data
+y_matrix <- matrix(y, nrow = length(y), ncol = ncol(gene_matrix))
+
+rmse_per_gene <- sqrt(colMeans((gene_matrix - y_matrix)^2))
+
+std_rmse_per_gene <- rmse_per_gene/sd_y
+
+
+
+#Appending Univariate Gene Model sRMSE and Base sRMSE to our genematrix
+rmse_row <- c(NA, NA, std_rmse_per_gene)
+basermse<- rep(std_rmse,times = ncol(is2norm01))
+basermse<- c(NA, NA,basermse)
+
+predgenematrix <- rbind(
+  predgenematrix,
+  Gene_Std_RMSE = rmse_row,
+  Base_Std_RMSE = basermse
+)
+
+row.names(predgenematrix)[nrow(predgenematrix)-1] <- "Gene_Std_RMSE"
+row.names(predgenematrix)[nrow(predgenematrix)]   <- "Base_Std_RMSE"
+
+predgenematrix <- rbind(
+  predgenematrix,
+  Diff_Std_RMSE = as.numeric(predgenematrix["Gene_Std_RMSE", ]) -
+              as.numeric(predgenematrix["Base_Std_RMSE", ])
+)
+```
+
+
+
+```{r}
+improvegenes <- predgenematrix %>%
+  slice(n()) %>%                        # last row dynamically
+  select(3:last_col()) %>%              # keep columns 3 to last
+  select(where(~ any(. < 0))) %>%       # keep only genes with negative values
+  pivot_longer(
+    cols = everything(),
+    names_to = "Genes",
+    values_to = "Diff_RMSE"
+  ) %>%
+  as.data.frame() %>%
+  mutate(Diff_RMSE = abs(Diff_RMSE)) %>%
+  arrange(desc(Diff_RMSE))
+
+sum(predgenematrix[nrow(predgenematrix), 3: ncol(predgenematrix) ] < 0) # Some of genes added to the base model to prove to improve the base model
+
+#2647 genes improved the Base Model
+```
+
+```{r}
+#CSV for DAVID enrichment tool
+
+justimprovegenesmale <- improvegenes %>% select(-Diff_RMSE) # gene list for David
+
+finalgenes <- predgenematrix[1:(nrow(predgenematrix) - 3), ]
+backgroundgenes <- finalgenes %>%
+  select(-maxFC) %>%               # remove column maxFC
+  colnames() %>%                   # get column names
+  as.data.frame() %>%              # convert to data frame
+  rename(Genes = '.') %>% # rename the column
+  slice(-1) %>% #remove participant_id as a row
+  as.data.frame()
+
+
+myfilepath <- "/Users/roayajannatipour/Desktop/ThesisProject2026_RoayaJannatipour/"
+
+
+write_csv(
+  justimprovegenesmale,
+  glue("{myfilepath}MaleUnivariateScreening/justimprovegenesmale.csv"),
+  col_names = TRUE
+)
+
+write_csv(
+  backgroundgenes,
+  glue("{myfilepath}MaleUnivariateScreening/backgroundgenes.csv"),
+  col_names = TRUE
+)
+
+```
+
+
+```{r}
+# Visualizations: 10 best, 10 worst, 10 baseline (observed vs predicted)
+
+finalgenes<- finalgenes %>% 
+  mutate(gender = "Male") %>% 
+  relocate(gender, .before = a1cf)
+
+DiffRMSE <- predgenematrix %>% slice(n(),) %>% select(-c(participant_id, maxFC)) %>% as.vector()
+#Top 10 Male Genes
+plot_list <- list()
+
+top10male <- improvegenes %>% slice(c(1:10),)
+write_csv(top10male, glue("{myfilepath}MaleUnivariateScreening/top10male.csv"), col_names = TRUE)
+
+
+for (i in 1:10) {
+  
+  top10malegene <- as.character(top10male$Genes[i])
+  maleintr2  <- cor(finalgenes[[top10malegene]], finalgenes$maxFC)^2
+  
+  p <- ggplot(finalgenes, aes(y=.data[[top10malegene]], x=maxFC, colour = gender)) +
+    geom_point(size = 3) + 
+    scale_colour_discrete(name = "Gender") +
+    xlim(-1, 12) +
+    ylim(-1, 12) +
+    annotate(
+      "text",
+      x = 4, y = 10,
+      size=8,
+      label = paste0(
+        "R² = ", round(maleintr2, 3),
+        "\nDiff sRMSE = ", abs(round(DiffRMSE[[top10malegene]], 3))
+      )
+    ) +
+     scale_colour_manual(
+    values = c("Male" = "blue"),
+    name = "Gender"
+  ) +
+    geom_abline(intercept=0, slope=1) +
+    labs(
+      x='Log Observed maxFC',
+      y ='Log Predicted maxFC',
+      title = paste('Observed vs. Predicted maxFC (Univariate Model):\n Gene', top10malegene)
+    ) +
+    coord_fixed() +
+    theme(
+  text = element_text(size = 18),
+  axis.title = element_text(size = 16),
+  axis.text = element_text(size = 19),
+  legend.text = element_text(size = 16),
+  legend.title = element_text(size = 16),
+  plot.title = element_text(size = 18)
+)
+
+  plot_list[[top10malegene]] <- p   # ✅ STORE IT HERE
+  
+  print(p)
+  
+  cat("Gene", i, "finished\n")
+}
+
+
+ggsave(
+  here("figurespng", "rfk.png"),
+  plot_list[["rfk"]],
+  width = 7,
+  height = 7,
+  dpi = 300
+)
+```
+
+
+
+```{r}
+#Bottom10 Genes
+
+bottom10male <- improvegenes %>% slice_tail(n=10)
+
+write_csv(bottom10male, glue("{myfilepath}MaleUnivariateScreening/bottom10male.csv"), col_names = TRUE)
+
+
+for (i in 1:10) {
+  gene <- as.character(bottom10male$Genes[i])
+    intr2  <- cor(finalgenes[[gene]], finalgenes$maxFC)^2
+p <- ggplot(finalgenes, aes(y=.data[[gene]], x=maxFC, colour=gender)) +
+  geom_point() + 
+  scale_colour_discrete(name = "Gender") +
+  xlim(-1, 12) +
+  ylim(-1, 12) +
+  annotate(
+  "text",
+  x = 1, y = 10,                 # position on plot (adjust if needed)
+  label = paste0(
+    "R² = ", round(intr2, 3),
+    "\nDiff sRMSE = ", round(DiffRMSE[[gene]], 3)
+  )) +
+     scale_colour_manual(
+    values = c("Male" = "blue"),
+    name = "Gender"
+  ) +
+  geom_abline(intercept=0, slope=1) +
+  labs(x='Log Predicted maxFC', y ='Log Actual maxFC') +
+  ggtitle(paste('Predicted vs. Actual maxFC: Gene', gene))
+
+print(p)
+
+cat("Gene", i, "finished\n")
+}
+```
+
+```{r}
+objects <- list(
+  cv_results  = cv_results,
+  improvegenes  = improvegenes,
+  folds  = folds,
+  n = n,
+  test_idx = test_idx,
+  train_idx = train_idx,
+  myfilepath = myfilepath,
+  k = k,
+  finalgenes = finalgenes,
+  predgenematrix = predgenematrix
+)
+
+for (name in names(objects)) {
+  saveRDS(
+    objects[[name]],
+    here("MaleUnivariateScreening", paste0(name, ".rds"))
+  )
+}
+```
+
+
+```{r}
+#Cleaning up objects
+
+rm(list = ls())
+
+```

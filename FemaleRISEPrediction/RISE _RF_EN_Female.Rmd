@@ -1,0 +1,607 @@
+---
+title: "RISE Gene Screening_Female"
+output: html_document
+date: "2026-04-09"
+---
+```{r}
+install.packages('SurrogateRank', repos = c('https://laylaparast.r-universe.dev', 'https://cloud.r-project.org'))
+```
+
+```{r}
+library(SurrogateRank)
+library(ranger)
+library(gt)
+library(flextable)
+library(dplyr)
+library(mlr)
+library(mlrMBO)
+library(tuneRanger)
+library(ggplot2)
+
+```
+
+```{r}
+#Reading in necessary objects
+
+#Load in all other objects from FemaleUnivariateScreening
+files <- list.files(
+  here("FemalePreProcessing"),
+  pattern = "\\.rds$",
+  full.names = TRUE
+)
+
+for (f in files) {
+  obj_name <- tools::file_path_sans_ext(basename(f))
+  assign(obj_name, readRDS(f))
+}
+```
+
+
+```{r}
+risefemale <- rise.screen(
+  yonefemale, #numeric vector of primary response values in the treated group (antibody values at Day 28)
+  yzerofemale, #numeric vector of primary response values in the untreated group (antibody values at Day 0)
+  sonefemale, #matrix or dataframe of surrogate candidates in the treated group with dimension n1 x p            where n1 is the number of treated samples and p the number of candidates. Sample ordering          must match exactly yone. (participant id x day 1 gene values)
+  szerofemale, #matrix or dataframe of surrogate candidates in the untreated group with dimension n0 x p           where n0 is the number of untreated samples and p the number of candidates. Sample                 ordering must match exactly yzero. (participant id x day 0 gene values)
+  alpha = 0.05,
+  epsilon = 0.25,
+  u.y.hyp = NULL,
+  p.correction = "BH",
+  n.cores = 1,
+  alternative = "two.sided",
+  paired = TRUE,
+  return.all.screen = TRUE,
+  return.all.weights = FALSE,
+  weight.mode = "inverse.delta",
+  normalise.weights = T
+)
+
+```
+
+
+```{r}
+risefemalesig <- risefemale$significant.markers
+
+
+saveRDS(
+  risefemalesig,
+  here("FemaleRISEPrediction", "risefemalesig.rds")
+)
+
+#280 significant markers
+```
+
+```{r}
+#Random Forest
+
+#Cross Validated Random Forest Model using 280 genes as input + plot observed vs. predicted values
+#Narrow data frame to 2004 columns i.e genes that improved the Base Model
+ageandpart <- BaseModel %>% select(age_imputed, maxFC, participant_id)
+
+improvegenematrix<- merge_studytime1_female - merge_studytime0_female
+
+rfgenematrix <- improvegenematrix[,unlist(risefemalesig)] # only grabbing improved genes for this matrix
+
+rfgenematrix$participant_id <- row.names(rfgenematrix)
+
+rfgenematrix<- rfgenematrix %>% left_join(ageandpart, by= 'participant_id')  %>% 
+  relocate(participant_id, maxFC, age_imputed) %>% select(-participant_id)
+# Use existing fold assignments 1-10
+```
+
+
+```{r}
+#Random Forest - RISE 
+
+#Setting up the Loop
+
+set.seed(123)
+k      <- 10
+n      <- nrow(rfgenematrix)
+p <- length(colnames(rfgenematrix)[colnames(rfgenematrix) != "maxFC"]) 
+folds    <- sample(rep(1:k, length.out = n))
+rffoldout   <- data.frame()
+rfpredictions <- numeric(n)
+dir.create(
+  here("FemaleRISEPrediction", "fold_importance_plots_female_rise"),
+  showWarnings = FALSE,
+  recursive = TRUE
+)
+importance_matrix <- matrix(0, nrow = k, ncol = p)
+colnames(importance_matrix) <- colnames(rfgenematrix)[colnames(rfgenematrix) != "maxFC"]
+
+for (i in 1:k) {
+  
+  train_idx <- which(folds != i)
+  test_idx  <- which(folds == i)
+
+  train_data <- rfgenematrix[train_idx,] # Using same training folds as Base Model
+  test_data  <- rfgenematrix[test_idx, ] # Using same testing folds as Base Model
+
+  
+  # Create mlr task from training fold
+  task <- makeRegrTask(data = train_data, target = "maxFC")
+  
+  # Tune hyperparameters on training fold only
+  tuned <- tuneRanger(
+    task,
+    measure        = list(mlr::rmse),
+    num.trees      = 100,
+    num.threads    = 1,
+    iters          = 30,
+    save.file.path = NULL
+  )
+  
+  # Extract best parameters
+  best_mtry       <- tuned$recommended.pars$mtry
+  best_nodesize   <- tuned$recommended.pars$min.node.size
+  best_samplefrac <- tuned$recommended.pars$sample.fraction
+  
+  # Fit final model with tuned parameters
+  fit <- ranger(
+    maxFC ~ .,
+    data            = train_data,
+    mtry            = best_mtry,
+    min.node.size   = best_nodesize,
+    sample.fraction = best_samplefrac,
+    num.trees       = 500,
+    importance      = "impurity"
+  )
+  
+  #Summarizing Importance Matrix
+  importance_matrix[i, ] <- fit$variable.importance
+  
+  #Plotting Importance per fold
+importance_df <- data.frame(
+  feature       = names(fit$variable.importance),
+  importance = fit$variable.importance
+) %>%
+  arrange(desc(importance)) %>%
+  slice(1:30)
+
+p_imp <- ggplot(importance_df, aes(x = reorder(feature, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title    = paste0("Variable Importance - Fold ", i),
+    subtitle = paste0("mtry=", best_mtry, 
+                      " | nodesize=", best_nodesize, 
+                      " | samplefrac=", round(best_samplefrac, 2)),
+    x        = "Feature",
+    y        = "Impurity Importance"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title    = element_text(face = "bold"),
+    axis.text.y   = element_text(size = 8)
+  )
+
+ggsave(
+  filename = here(
+    "FemaleRISEPrediction",
+    "fold_importance_plots_female_rise",
+    paste0("fold_", i, "_importance.png")
+  ),
+  plot   = p_imp,
+  width  = 8,
+  height = 10,
+  dpi    = 300
+)
+###
+  # Predict on test fold
+  rfpredictions[test_idx] <- predict(fit, data = test_data)$predictions
+  
+  # Compute fold level metrics
+  ss_res   <- sum((rfgenematrix$maxFC[test_idx] - rfpredictions[test_idx])^2)
+  ss_tot   <- sum((rfgenematrix$maxFC[test_idx] - mean(rfgenematrix$maxFC[train_idx]))^2)
+  rsquared <- 1 - (ss_res / ss_tot)
+  rmse <- sqrt(mean((rfpredictions[test_idx] - rfgenematrix$maxFC[test_idx])^2))
+  sd_y <- sd(rfgenematrix$maxFC)
+  srmse <- rmse/ sd_y
+
+  rffoldout <- rbind(rffoldout, data.frame(
+    fold            = i,
+    mtry            = best_mtry,
+    min.node.size   = best_nodesize,
+    sample.fraction = best_samplefrac,
+    srmse             = srmse,
+    rsquared        = rsquared
+  ))
+  
+  cat(sprintf("Fold %d | mtry=%d, nodesize=%d, samplefrac=%.2f | R2=%.3f\n",
+              i, best_mtry, best_nodesize, best_samplefrac, rsquared))
+}
+
+# Overall metrics across all observations
+ss_res_total <- sum((rfgenematrix$maxFC - rfpredictions)^2)
+ss_tot_total <- sum((rfgenematrix$maxFC - mean(rfgenematrix$maxFC))^2)
+overall_r2   <- 1 - (ss_res_total / ss_tot_total)
+overall_rmse  <- sqrt(mean((rfgenematrix$maxFC - rfpredictions)^2))
+overall_srmse <- overall_rmse/ sd_y
+
+
+cat(sprintf("\nOverall R2: %.3f | Overall sRMSE: %.3f\n", overall_r2, overall_srmse))
+
+# View per fold tuning results
+print(rffoldout)
+
+# ---- AFTER LOOP ---- Importance Matrix
+
+# Summarize importance across folds
+importance_df_all <- data.frame(
+  feature     = colnames(importance_matrix),
+  mean_imp = colMeans(importance_matrix),
+  sd_imp   = apply(importance_matrix, 2, sd)
+) %>%
+  mutate(
+    cv = sd_imp / mean_imp,      # stability: lower = more consistent across folds
+    se = sd_imp / sqrt(k)
+  ) %>%
+  arrange(desc(mean_imp))
+
+# Top 30 by mean importance
+top20 <- importance_df_all %>% slice(1:20)
+
+# Plot 1: Mean +/- SD bar plot
+ggplot(top20, aes(x = reorder(feature, mean_imp), y = mean_imp)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_errorbar(aes(ymin = mean_imp - sd_imp,
+                    ymax = mean_imp + sd_imp),
+                width = 0.3, colour = "black") +
+  coord_flip() +
+  labs(
+    title = "Top 20 Features by Mean Variable Importance Across 10 CV Folds",
+    x     = "Feature",
+    y     = "Mean Impurity Importance ± SD"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title  = element_text(face = "bold"),
+    axis.text.y = element_text(size = 8)
+  )
+
+ggsave(
+  filename = here(
+    "FemaleRISEPrediction",
+    "fold_importance_plots_female_rise",
+    "mean_importance_top20.png"
+  ),
+  width = 8,
+  height = 10,
+  dpi = 300
+)
+
+# Plot 2: Stability plot -- mean importance vs CV
+# Best features are top-right (high importance) and left (low CV = stable)
+ggplot(importance_df_all %>% slice(1:20),
+       aes(x = cv, y = mean_imp, label = feature)) +
+  geom_point(colour = "steelblue") +
+  ggrepel::geom_text_repel(size = 3) +
+  labs(
+    title = "Importance vs Stability Across Folds (Top 20 Features)",
+    x     = "Coefficient of Variation (lower = more stable)",
+    y     = "Mean Importance"
+  ) +
+  theme_bw()
+
+ggsave(
+  filename = here(
+    "FemaleRISEPrediction",
+    "fold_importance_plots_female_rise",
+    "importance_stability.png"
+  ),
+  width = 10,
+  height = 8,
+  dpi = 300
+)
+# Plot 3: Heatmap of importance per fold
+
+imp_scaled <- apply(importance_matrix, 1, function(x) x / max(x))
+top20_features <- importance_df_all$feature[1:20]
+
+
+heatmap <- pheatmap(
+  t(imp_scaled[top20_features, ]),
+  cluster_cols = TRUE,
+  cluster_rows = FALSE,
+  labels_row   = paste0("Fold ", 1:k),
+  main         = "Normalized Variable Importance Per Fold (Top 20)",
+  filename     = here(
+    "FemaleRISEPrediction",
+    "fold_importance_plots_female_rise",
+    "importance_heatmap.png"
+  ),
+  width        = 12,
+  height       = 6
+)
+
+# Print summary table
+cat("\n--- Top 20 Features by Mean Importance ---\n")
+print(top20)
+
+# Most stable important features (low CV, high mean)
+cat("\n--- Most Stable Important Features (CV < 0.3) ---\n")
+importance_df_all %>%
+  filter(cv < 0.3) %>%
+  slice(1:20) %>%
+  print()
+
+
+```
+
+
+
+```{r}
+# Build a dataframe of observed vs predicted
+rf_results <- data.frame(
+  observed  = rfgenematrix$maxFC,
+  predicted = rfpredictions
+)
+
+# Compute R²
+r2 <- cor(rf_results$observed, rf_results$predicted)^2
+
+# Evaluate with RMSE (correct metric for continuous outcome)
+rmse <- sqrt(mean((rfpredictions - rf_results$observed)^2)) # Should this be callign from test data or Base Model
+
+## Standardised RMSE (RMSE divided by standard deviation of response)
+sd_y <- sd(rf_results$observed)
+std_rmse_rg <- rmse/ sd_y
+print(paste("sRMSE:", round(std_rmse_rg, 4)))
+
+# Plot
+rffemaleriseplot <- ggplot(rf_results, aes(x = observed, y = predicted)) +
+  geom_point(alpha = 0.6, colour = "pink") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", colour = "red") +
+  annotate(
+    "text",
+    x = 1,
+    y = 10,
+    hjust = 0, vjust = 1,
+    label = paste0(
+      "R² = ", round(r2, 3),
+      "\nsRMSE = ", round(std_rmse_rg, 3)
+    )
+  ) +
+  xlim(-1, 12) +
+  ylim(-1, 12) +
+  coord_fixed() +
+  labs(
+    x     = "Log Observed maxFC",
+    y     = "Log Predicted maxFC",
+    title = "Observed vs. Predicted maxFC (Female RISE): Random Forest"
+  ) +
+  theme_bw()
+
+
+```
+
+```{r}
+saveRDS(
+  rffemaleriseplot,
+  here("figuresrds", "rffemaleriseplot.rds")
+)
+```
+
+
+```{r}
+engenematrix <- rfgenematrix %>% select(-c(age_imputed, maxFC))
+
+```
+
+```{r}
+#Elastic Net - RISE 
+
+set.seed(123)
+k <- 10
+n <- nrow(engenematrix)
+folds <- sample(rep(1:k, length.out = n))
+results   <- data.frame()
+y <- rfgenematrix$maxFC
+all_preds <- matrix(0, nrow = n, ncol = length(seq(0, 1, by = 0.2)))
+all_coefs <- vector("list", length(seq(0, 1, by = 0.2)))
+a_idx <- 0
+
+for (a in seq(0, 1, by = 0.2)) {
+  a_idx <- a_idx + 1
+  enpredictions <- numeric(n)
+  fold_features <- numeric(k)
+  fold_coefs    <- vector("list", k)
+
+  for (i in 1:k) {
+    train_idx <- which(folds != i)
+    test_idx  <- which(folds == i)
+    x.train <- engenematrix[train_idx, ]
+    x.test  <- engenematrix[test_idx, ]
+    y.train <- y[train_idx]
+    y.test  <- y[test_idx]
+    train_scaled <- scale(x.train)
+    x.train      <- as.matrix(train_scaled)
+    x.test       <- as.matrix(scale(x.test,
+                      center = attr(train_scaled, "scaled:center"),
+                      scale  = attr(train_scaled, "scaled:scale")))
+    fit <- cv.glmnet(x.train, y.train,
+                     type.measure = "mse",
+                     alpha        = a,
+                     family       = "gaussian")
+  
+   coef_matrix <- as.matrix(coef(fit, s = fit$lambda.min))
+  fold_features[i] <- sum(coef_matrix[-1,] != 0)
+ 
+    
+# Check what lambda.min looks like across alphas
+cat(sprintf("alpha=%.1f | fold=%d | lambda.min=%.4f | features=%d\n",
+            a, i, fit$lambda.min, sum(coef_matrix[-1,] != 0)))
+
+    enpredictions[test_idx] <- predict(fit, s = fit$lambda.min, newx = x.test)
+    fold_coefs[[i]]         <- coef(fit, s = fit$lambda.min)
+    
+  }
+
+  all_coefs[[a_idx]] <- fold_coefs
+  all_preds[, a_idx] <- enpredictions
+
+  ss_res   <- sum((y - enpredictions)^2)
+  ss_tot   <- sum((y - mean(y))^2)
+  rsquared <- 1 - (ss_res / ss_tot)
+  rmse     <- sqrt(mean((y - enpredictions)^2))
+  sd_y     <- sd(y)
+  srmse    <- rmse / sd_y
+
+  temp <- data.frame(
+    alpha         = a,
+    srmse         = srmse,
+    rsquared      = rsquared,
+    mean_features = mean(fold_features),
+    sd_features   = sd(fold_features)
+  )
+  results <- rbind(results, temp)
+  cat(sprintf("alpha=%.1f | R2=%.3f | sRMSE=%.3f | mean_features=%.1f\n",
+              a, rsquared, srmse, mean(fold_features)))
+}
+
+# Select best alpha by sRMSE
+best_idx           <- which.min(results$srmse)
+enpredictions_best <- all_preds[, best_idx]
+
+cat("\n--- Best Alpha Results ---\n")
+print(results[best_idx, ])
+
+# Overall metrics for best alpha
+ss_res_best  <- sum((y - enpredictions_best)^2)
+ss_tot_best  <- sum((y - mean(y))^2)
+overall_r2   <- 1 - (ss_res_best / ss_tot_best)
+overall_rmse <- sqrt(mean((y - enpredictions_best)^2))
+overall_srmse <- overall_rmse / sd(y)
+cat(sprintf("Overall R2: %.3f | Overall sRMSE: %.3f\n", overall_r2, overall_srmse))
+
+# Feature selection frequency across folds for best alpha
+best_coefs <- all_coefs[[best_idx]]
+
+feature_counts <- lapply(best_coefs, function(cf) {
+  cf_mat <- as.matrix(cf)
+  rownames(cf_mat)[cf_mat[, 1] != 0]
+}) %>%
+  unlist() %>%
+  table() %>%
+  sort(decreasing = TRUE)
+
+feature_df <- data.frame(
+  gene           = names(feature_counts),
+  folds_selected = as.numeric(feature_counts)
+) %>% filter(gene != "(Intercept)") %>%
+  arrange(desc(folds_selected))
+
+
+cat("\n--- Feature Selection Frequency (Best Alpha) ---\n")
+print(feature_df)
+
+# Features selected in all 10 folds
+stable_features <- feature_df %>% filter(folds_selected == k)
+cat(sprintf("\nFeatures selected in all %d folds:\n", k))
+print(stable_features)
+
+# All results summary
+cat("\n--- All Alpha Results ---\n")
+print(results)
+
+```
+
+```{r}
+alphatablerisefemale <- flextable(results) %>% 
+  bold(i = which(results$alpha == results$alpha[best_idx])) %>%
+  add_footer_lines("Bold row indicates optimal alpha selection for final model.") %>%
+  autofit() %>%
+  theme_vanilla()
+
+save_as_html(
+  alphatablerisefemale,
+  path = here("FemaleRISEPrediction", "alphatablerisefemale.html")
+)
+```
+
+```{r}
+elasticnetrisefemale <- feature_df %>%
+  gt() %>% 
+  tab_header(
+    title = "Elastic Net Gene Frequencies", 
+    subtitle = "RISE Screening - Females") %>%
+  cols_label(
+    gene ="Gene",
+    folds_selected = "Folds Selected"
+  )
+
+gt::gtsave(
+  elasticnetrisefemale,
+  here("FemaleRISEPrediction", "elasticnetrisefemale.html")
+)
+```
+
+```{r}
+write.csv(
+  feature_df,
+  here("FemaleRISEPrediction", "en_genefreq_female_rise.csv"),
+  row.names = TRUE
+)
+
+write.csv(
+  results,
+  here("FemaleRISEPrediction", "en_alphaperformance_female_rise.csv"),
+  row.names = TRUE
+)
+```
+
+
+```{r}
+# Build a dataframe of observed vs predicted
+en_results <- data.frame(
+  observed  = rfgenematrix$maxFC,
+  predicted = enpredictions_best
+)
+
+r2 <- cor(en_results$observed, en_results$predicted)^2
+
+# Evaluate with RMSE (correct metric for continuous outcome)
+rmse <- sqrt(mean((enpredictions_best - en_results$observed)^2)) # Should this be callign from test data or Base Model
+
+## Standardised RMSE (RMSE divided by standard deviation of response)
+sd_y <- sd(en_results$observed)
+std_rmse_en <- rmse/ sd_y
+print(paste("sRMSE:", round(std_rmse_en, 4)))
+
+# Plot
+elasticnetfemaleriseplot <- ggplot(en_results, aes(x = observed, y = predicted)) +
+  geom_point(alpha = 0.6, colour = "pink") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", colour = "red") +
+  annotate(
+    "text",
+    x = 1,
+    y = 10,
+    hjust = 0, vjust = 1,
+    label = paste0(
+      "R² = ", round(r2, 3),
+      "\nsRMSE = ", round(std_rmse_en, 3)
+      )
+  ) +
+  xlim(-1, 12) +
+  ylim(-1, 12) +
+  coord_fixed() +
+  labs(
+    x     = "Log Observed maxFC",
+    y     = "Log Predicted maxFC",
+    title = "Observed vs. Predicted maxFC (Female RISE): Elastic Net"
+  ) +
+  theme_bw()
+```
+
+```{r}
+saveRDS(
+  elasticnetfemaleriseplot,
+  here("figuresrds", "elasticnetfemaleriseplot.rds")
+)
+```
+
+```{r}
+rm(list = ls())
+```
+
